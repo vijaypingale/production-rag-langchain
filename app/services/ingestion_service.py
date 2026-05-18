@@ -3,7 +3,6 @@ Ingestion Service Layer
 
 Responsibilities:
 -----------------
-- Save uploaded files
 - Trigger PDF ingestion
 - Trigger chunking pipeline
 - Return ingestion summary
@@ -15,13 +14,20 @@ Business logic stays outside API routes.
 
 Flow:
 ------
-API Request → save_uploaded_file() → process_uploaded_pdf()
-    ↓              ↓                       ↓
-Upload       Save to disk           Load PDF → Chunk → Response
+API Request → process_uploaded_file_in_memory()
+    ↓                       ↓
+Upload           Load PDF (temp in-memory) → Chunk → Response
+
+Legacy/optional persistence:
+----------------------------
+- save_uploaded_file() still exists for explicit disk persistence
+  but is not used by the current upload API route.
 """
 
 from pathlib import Path
 import shutil
+import tempfile
+import time
 
 from app.ingestion.pdf_loader import load_pdf
 from app.ingestion.text_splitter import split_documents
@@ -33,7 +39,7 @@ from app.utils.logger import logger
 # Configuration
 # ============================================================================
 
-# Directory where uploaded PDFs are stored on disk
+# Directory where uploaded PDFs are stored on disk when persistence is required
 DOCUMENTS_DIR = "data/documents"
 
 
@@ -58,6 +64,10 @@ def save_uploaded_file(upload_file):
         
     Returns:
         str: Full path to saved file (e.g., "data/documents/sample.pdf")
+
+    Notes:
+        This helper persists uploads to disk for legacy or audit use.
+        The current API upload path prefers in-memory processing.
     """
 
     # Construct destination path: data/documents/{filename}
@@ -75,6 +85,131 @@ def save_uploaded_file(upload_file):
 
     # Return path for next step in pipeline
     return str(upload_path)
+
+
+async def process_uploaded_file_in_memory(upload_file):
+    """
+    Process uploaded PDF entirely in-memory (uses a temporary file for PyMuPDF compatibility).
+
+    This function does NOT persist the PDF in the project's data folders.
+    It writes a short-lived temp file, loads it with existing loaders, then removes the temp file.
+
+    Args:
+        upload_file: FastAPI UploadFile
+
+    Returns:
+        dict: ingestion summary (same shape as `process_uploaded_pdf`)
+    """
+
+    logger.info(
+        "pdf_processing_in_memory_started",
+        file_name=upload_file.filename,
+        content_type=getattr(upload_file, "content_type", None)
+    )
+
+    overall_start = time.perf_counter()
+    try:
+        # Read bytes from the upload (async)
+        read_start = time.perf_counter()
+        file_bytes = await upload_file.read()
+        read_time = time.perf_counter() - read_start
+
+        logger.info(
+            "file_bytes_read_from_memory",
+            file_name=upload_file.filename,
+            size_bytes=len(file_bytes),
+            read_duration_seconds=round(read_time, 4)
+        )
+
+        # Write to a platform-safe temporary file (deleted after processing)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        tmp_path = Path(tmp.name)
+        try:
+            tmp.write(file_bytes)
+            tmp.flush()
+        finally:
+            tmp.close()
+
+        logger.info(
+            "temp_pdf_written",
+            temp_path=str(tmp_path),
+            temp_file_size_bytes=len(file_bytes)
+        )
+
+        # Load PDF and measure load duration
+        load_start = time.perf_counter()
+        documents = load_pdf(str(tmp_path))
+        load_time = time.perf_counter() - load_start
+
+        logger.info(
+            "pdf_loaded_from_memory",
+            file_name=upload_file.filename,
+            total_documents=len(documents),
+            load_duration_seconds=round(load_time, 4)
+        )
+
+        # Split documents into semantic chunks and measure chunking duration
+        chunk_start = time.perf_counter()
+        chunks = split_documents(documents)
+        chunk_time = time.perf_counter() - chunk_start
+
+        logger.info(
+            "documents_split_into_chunks",
+            file_name=upload_file.filename,
+            total_chunks=len(chunks),
+            chunk_duration_seconds=round(chunk_time, 4)
+        )
+
+        cleanup_start = time.perf_counter()
+        try:
+            tmp_path.unlink()
+            cleanup_time = time.perf_counter() - cleanup_start
+            logger.info(
+                "temp_file_deleted",
+                temp_path=str(tmp_path),
+                cleanup_duration_seconds=round(cleanup_time, 4)
+            )
+        except Exception as ex:
+            cleanup_time = time.perf_counter() - cleanup_start
+            logger.warning(
+                "temp_file_delete_failed",
+                temp_path=str(tmp_path),
+                error=str(ex),
+                cleanup_duration_seconds=round(cleanup_time, 4)
+            )
+
+        total_time = time.perf_counter() - overall_start
+        logger.info(
+            "pdf_processing_in_memory_completed",
+            file_name=upload_file.filename,
+            total_documents=len(documents),
+            total_chunks=len(chunks),
+            total_duration_seconds=round(total_time, 4),
+            read_duration_seconds=round(read_time, 4),
+            load_duration_seconds=round(load_time, 4),
+            chunk_duration_seconds=round(chunk_time, 4),
+            cleanup_duration_seconds=round(cleanup_time, 4)
+        )
+
+        return {
+            "status": "success",
+            "total_documents": len(documents),
+            "total_chunks": len(chunks)
+        }
+
+    except Exception as ex:
+        logger.error(
+            "pdf_processing_in_memory_failed",
+            file_name=upload_file.filename,
+            error=str(ex)
+        )
+        # Attempt cleanup if temp exists
+        try:
+            if 'tmp_path' in locals() and tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        raise
 
 
 # ============================================================================

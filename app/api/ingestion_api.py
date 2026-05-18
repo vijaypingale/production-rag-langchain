@@ -1,8 +1,8 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
 
 from app.services.ingestion_service import (
-    save_uploaded_file,
-    process_uploaded_pdf
+    process_uploaded_pdf,
+    process_uploaded_file_in_memory
 )
 
 from app.utils.logger import logger
@@ -45,16 +45,10 @@ async def upload_pdf(
         )
 
         # =====================================================
-        # Save uploaded file
+        # Trigger ingestion pipeline in memory
         # =====================================================
 
-        saved_file_path = save_uploaded_file(file)
-
-        # =====================================================
-        # Trigger ingestion pipeline
-        # =====================================================
-
-        result = process_uploaded_pdf(saved_file_path)
+        result = await process_uploaded_file_in_memory(file)
 
         return result
 
