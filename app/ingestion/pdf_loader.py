@@ -22,6 +22,20 @@ from app.utils.logger import logger
 
 
 def extract_pdf_metadata(pdf_path: str):
+    """
+    Extract PDF metadata using PyMuPDF (fitz).
+    
+    Purpose: Diagnostic information about PDF before processing
+    
+    Extracts:
+    - Total page count
+    - Image detection (if contains images)
+    - Encryption status
+    - PDF metadata (title, author, etc.)
+    
+    Args:
+        pdf_path (str): Full path to PDF file
+    """
 
     pdf_document = fitz.open(pdf_path)
 
@@ -31,6 +45,7 @@ def extract_pdf_metadata(pdf_path: str):
 
     has_images = False
 
+    # Scan through pages to detect images
     for page_num in range(total_pages):
 
         page = pdf_document.load_page(page_num)
@@ -39,6 +54,7 @@ def extract_pdf_metadata(pdf_path: str):
             has_images = True
             break
 
+    # Log metadata details for audit trail
     logger.info(
         "pdf_metadata_extracted",
         file_name=Path(pdf_path).name,
@@ -52,6 +68,27 @@ def extract_pdf_metadata(pdf_path: str):
 
 
 def load_pdf(pdf_path: str):
+    """
+    Load PDF and return LangChain Document objects.
+    
+    Process:
+    --------
+    1. Validate file exists
+    2. Extract metadata using PyMuPDF (fitz) for diagnostics
+    3. Create LangChain PyMuPDFLoader
+    4. Load PDF → Returns standardized Document objects
+    5. Log results and return
+    
+    Args:
+        pdf_path (str): Full path to PDF file
+        
+    Returns:
+        List[LangChain Document]: One Document per page with metadata
+        
+    Why Two Libraries:
+    - PyMuPDF (fitz): Direct access to PDF internals (metadata, images, encryption)
+    - PyMuPDFLoader (LangChain): Standardized Document extraction for RAG pipeline
+    """
 
     path = Path(pdf_path)
 
@@ -69,22 +106,28 @@ def load_pdf(pdf_path: str):
         file_name=path.name
     )
 
+    # Step 1: Extract metadata using PyMuPDF (fitz)
+    # This gives us diagnostic info: page count, images, encryption
     extract_pdf_metadata(pdf_path)
 
+    # Step 2: Load PDF using LangChain's PyMuPDFLoader
+    # PyMuPDFLoader uses PyMuPDF internally but returns standardized Documents
     loader = PyMuPDFLoader(str(path))
 
+    # Returns: List[Document] - one Document per page
     documents = loader.load()
 
     logger.info(
         "pdf_loaded_successfully",
         total_documents=len(documents),
-        sample_metadata=documents[0].metadata
+        sample_metadata=documents[0].metadata if documents else None
     )
 
-    logger.info(
-        "sample_document_preview",
-        content=documents[0].page_content[:500]
-    )
+    if documents:
+        logger.info(
+            "sample_document_preview",
+            content=documents[0].page_content[:500]
+        )
 
     return documents
 
