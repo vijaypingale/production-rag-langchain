@@ -5,6 +5,7 @@ Responsibilities:
 -----------------
 - Trigger PDF ingestion
 - Trigger chunking pipeline
+- Trigger embedding generation
 - Return ingestion summary
 
 Enterprise Principle:
@@ -15,8 +16,8 @@ Business logic stays outside API routes.
 Flow:
 ------
 API Request → process_uploaded_file_in_memory()
-    ↓                       ↓
-Upload           Load PDF (temp in-memory) → Chunk → Response
+    ↓
+Load PDF → Chunk Documents → Generate Embeddings → Response
 
 Legacy/optional persistence:
 ----------------------------
@@ -31,6 +32,7 @@ import time
 
 from app.ingestion.pdf_loader import load_pdf
 from app.ingestion.text_splitter import split_documents
+from app.embeddings.embedding_generator import generate_embeddings
 
 from app.utils.logger import logger
 
@@ -39,7 +41,6 @@ from app.utils.logger import logger
 # Configuration
 # ============================================================================
 
-# Directory where uploaded PDFs are stored on disk when persistence is required
 DOCUMENTS_DIR = "data/documents"
 
 
@@ -50,55 +51,40 @@ DOCUMENTS_DIR = "data/documents"
 def save_uploaded_file(upload_file):
     """
     Save uploaded file from memory to disk.
-    
-    Process:
-    --------
-    1. Create destination path: data/documents/{filename}
-    2. Open file in write-binary mode
-    3. Copy file from memory buffer to disk (streaming)
-    4. Log successful save
-    5. Return file path for downstream processing
-    
-    Args:
-        upload_file: FastAPI UploadFile object with .filename and .file
-        
-    Returns:
-        str: Full path to saved file (e.g., "data/documents/sample.pdf")
-
-    Notes:
-        This helper persists uploads to disk for legacy or audit use.
-        The current API upload path prefers in-memory processing.
     """
 
-    # Construct destination path: data/documents/{filename}
     upload_path = Path(DOCUMENTS_DIR) / upload_file.filename
 
-    # Stream copy from memory → disk (efficient for large files)
     with open(upload_path, "wb") as buffer:
         shutil.copyfileobj(upload_file.file, buffer)
 
-    # Log success with filename for audit trail
     logger.info(
         "file_uploaded_successfully",
         file_name=upload_file.filename
     )
 
-    # Return path for next step in pipeline
     return str(upload_path)
 
 
+# ============================================================================
+# In-Memory Upload Processing Pipeline
+# ============================================================================
+
 async def process_uploaded_file_in_memory(upload_file):
     """
-    Process uploaded PDF entirely in-memory (uses a temporary file for PyMuPDF compatibility).
+    Process uploaded PDF entirely in-memory.
 
-    This function does NOT persist the PDF in the project's data folders.
-    It writes a short-lived temp file, loads it with existing loaders, then removes the temp file.
-
-    Args:
-        upload_file: FastAPI UploadFile
-
-    Returns:
-        dict: ingestion summary (same shape as `process_uploaded_pdf`)
+    Pipeline:
+    ---------
+    Upload
+        ↓
+    PDF Loading
+        ↓
+    Chunking
+        ↓
+    Embedding Generation
+        ↓
+    Response
     """
 
     logger.info(
@@ -108,10 +94,17 @@ async def process_uploaded_file_in_memory(upload_file):
     )
 
     overall_start = time.perf_counter()
+
     try:
-        # Read bytes from the upload (async)
+
+        # =====================================================================
+        # Step 1: Read uploaded file bytes
+        # =====================================================================
+
         read_start = time.perf_counter()
+
         file_bytes = await upload_file.read()
+
         read_time = time.perf_counter() - read_start
 
         logger.info(
@@ -121,12 +114,21 @@ async def process_uploaded_file_in_memory(upload_file):
             read_duration_seconds=round(read_time, 4)
         )
 
-        # Write to a platform-safe temporary file (deleted after processing)
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        # =====================================================================
+        # Step 2: Write temporary PDF file
+        # =====================================================================
+
+        tmp = tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".pdf"
+        )
+
         tmp_path = Path(tmp.name)
+
         try:
             tmp.write(file_bytes)
             tmp.flush()
+
         finally:
             tmp.close()
 
@@ -136,9 +138,14 @@ async def process_uploaded_file_in_memory(upload_file):
             temp_file_size_bytes=len(file_bytes)
         )
 
-        # Load PDF and measure load duration
+        # =====================================================================
+        # Step 3: Load PDF documents
+        # =====================================================================
+
         load_start = time.perf_counter()
+
         documents = load_pdf(str(tmp_path))
+
         load_time = time.perf_counter() - load_start
 
         logger.info(
@@ -148,9 +155,14 @@ async def process_uploaded_file_in_memory(upload_file):
             load_duration_seconds=round(load_time, 4)
         )
 
-        # Split documents into semantic chunks and measure chunking duration
+        # =====================================================================
+        # Step 4: Split documents into semantic chunks
+        # =====================================================================
+
         chunk_start = time.perf_counter()
+
         chunks = split_documents(documents)
+
         chunk_time = time.perf_counter() - chunk_start
 
         logger.info(
@@ -160,17 +172,60 @@ async def process_uploaded_file_in_memory(upload_file):
             chunk_duration_seconds=round(chunk_time, 4)
         )
 
+        # =====================================================================
+        # Step 5: Generate semantic embeddings
+        # =====================================================================
+
+        embedding_start = time.perf_counter()
+
+        embeddings = generate_embeddings(chunks)
+
+        embedding_time = time.perf_counter() - embedding_start
+
+        logger.info(
+            "embeddings_generated_successfully",
+
+            # File Context
+            file_name=upload_file.filename,
+
+            # Embedding Statistics
+            total_embeddings=len(embeddings),
+
+            # OpenAI Embedding Vector Dimension
+            embedding_dimension=len(embeddings[0]),
+
+            # Validate Chunk-to-Embedding Mapping
+            source_chunks=len(chunks),
+
+            # Sample Vector Preview
+            sample_embedding_preview=embeddings[0][:5],
+
+            # Performance Metrics
+            embedding_duration_seconds=round(embedding_time, 4)
+        )
+
+        # =====================================================================
+        # Step 6: Cleanup temporary file
+        # =====================================================================
+
         cleanup_start = time.perf_counter()
+
         try:
+
             tmp_path.unlink()
+
             cleanup_time = time.perf_counter() - cleanup_start
+
             logger.info(
                 "temp_file_deleted",
                 temp_path=str(tmp_path),
                 cleanup_duration_seconds=round(cleanup_time, 4)
             )
+
         except Exception as ex:
+
             cleanup_time = time.perf_counter() - cleanup_start
+
             logger.warning(
                 "temp_file_delete_failed",
                 temp_path=str(tmp_path),
@@ -178,99 +233,81 @@ async def process_uploaded_file_in_memory(upload_file):
                 cleanup_duration_seconds=round(cleanup_time, 4)
             )
 
+        # =====================================================================
+        # Final Pipeline Completion Log
+        # =====================================================================
+
         total_time = time.perf_counter() - overall_start
+
         logger.info(
             "pdf_processing_in_memory_completed",
             file_name=upload_file.filename,
             total_documents=len(documents),
             total_chunks=len(chunks),
+            total_embeddings=len(embeddings),
             total_duration_seconds=round(total_time, 4),
             read_duration_seconds=round(read_time, 4),
             load_duration_seconds=round(load_time, 4),
             chunk_duration_seconds=round(chunk_time, 4),
+            embedding_duration_seconds=round(embedding_time, 4),
             cleanup_duration_seconds=round(cleanup_time, 4)
         )
 
         return {
             "status": "success",
             "total_documents": len(documents),
-            "total_chunks": len(chunks)
+            "total_chunks": len(chunks),
+            "total_embeddings": len(embeddings)
         }
 
     except Exception as ex:
+
         logger.error(
             "pdf_processing_in_memory_failed",
             file_name=upload_file.filename,
             error=str(ex)
         )
-        # Attempt cleanup if temp exists
+
         try:
             if 'tmp_path' in locals() and tmp_path.exists():
                 tmp_path.unlink()
+
         except Exception:
             pass
+
         raise
 
 
 # ============================================================================
-# RAG Pipeline Orchestration
+# Legacy Disk-Based Processing Flow
 # ============================================================================
 
 def process_uploaded_pdf(file_path: str):
     """
-    Orchestrate complete PDF ingestion & chunking pipeline.
-    
-    Pipeline Steps:
-    ---------------
-    1. Log pipeline start with file path
-    2. Load PDF → Extract text into LangChain Documents (one per page)
-    3. Split Documents → Break into semantic chunks (1000 chars, 200 char overlap)
-    4. Log pipeline completion with statistics
-    5. Return summary with document & chunk counts
-    
-    Args:
-        file_path (str): Full path to PDF file (e.g., "data/documents/sample.pdf")
-        
-    Returns:
-        dict: {
-            "status": "success",
-            "total_documents": N,    # Number of pages/documents
-            "total_chunks": M        # Number of semantic chunks
-        }
-        
-    Flow:
-    -----
-    PDF File → load_pdf() → LangChain Documents (pages)
-             ↓ split_documents() → LangChain Documents (chunks)
-             ↓ Return results
+    Legacy disk-based ingestion pipeline.
     """
 
-    # Log pipeline initialization for observability
     logger.info(
         "pdf_ingestion_pipeline_started",
         file_path=file_path
     )
 
-    # Step 1: Load PDF using LangChain's PyMuPDFLoader
-    # Also extracts metadata using PyMuPDF (fitz) for diagnostics
-    # Returns: List[Document] with one Document per page
     documents = load_pdf(file_path)
 
-    # Step 2: Split documents into semantic chunks
-    # Uses RecursiveCharacterTextSplitter (1000 char chunks, 200 char overlap)
-    # Returns: List[Document] with smaller chunks for efficient retrieval
     chunks = split_documents(documents)
 
-    # Log pipeline completion with metrics
+    embeddings = generate_embeddings(chunks)
+
     logger.info(
         "pdf_ingestion_pipeline_completed",
-        total_documents=len(documents),  # Total pages extracted
-        total_chunks=len(chunks)         # Total chunks created
+        total_documents=len(documents),
+        total_chunks=len(chunks),
+        total_embeddings=len(embeddings)
     )
 
-    # Return structured response for API client
     return {
         "status": "success",
-        "total_documents": len(documents),  # Pages/Documents from PDF
-        "total_chunks": len(chunks)         # Semantic chunks for RAG
+        "total_documents": len(documents),
+        "total_chunks": len(chunks),
+        "total_embeddings": len(embeddings)
     }

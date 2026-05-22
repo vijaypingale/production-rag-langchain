@@ -7,3 +7,8 @@ structlog
 fastapi
 uvicorn
 python-multipart
+
+openai
+langchain-openai
+python-dotenv
+numpy

@@ -17,3 +17,15 @@ PDF_PATH = "data/documents/wiser-provider-supplier-guide.pdf"
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
+
+"""
+Embedding Configuration
+"""
+
+EMBEDDING_MODEL = "text-embedding-3-small"
+
+"""
+Embedding Batch Configuration
+"""
+
+EMBEDDING_BATCH_SIZE = 100
